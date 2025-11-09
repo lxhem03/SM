@@ -15,4 +15,4 @@ RUN pip install backoff
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Default command to run the bot
-CMD gunicorn app:app && python3 bot.py
+CMD gunicorn app:app & python3 bot.py
