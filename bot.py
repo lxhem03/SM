@@ -1,3 +1,4 @@
+#V2
 import os
 import asyncio
 import tempfile
@@ -149,6 +150,11 @@ class StreamingUploader:
             task.file_size = os.path.getsize(file_path)
             last_time = datetime.now()
             last_current = 0
+            thumbnail_path = None
+
+            if upload_mode == "video":
+                thumbnail_path = os.path.join(os.path.dirname(file_path), "thumb.jpg")
+                await AsyncVideoProcessor.create_thumbnail_async(file_path, thumbnail_path)
 
             async def progress(current, total):
                 nonlocal last_time, last_current
@@ -162,7 +168,7 @@ class StreamingUploader:
                     last_time, last_current = now, current
 
             if upload_mode == "video":
-                await client.send_video(chat_id, file_path, caption=caption, thumb=None, progress=progress)
+                await client.send_video(chat_id, file_path, caption=caption, thumb=thumbnail_path, progress=progress)
             else:
                 await client.send_document(chat_id, file_path, caption=caption, progress=progress)
             await task_manager.update(task_id, status="completed", progress=100)
@@ -253,17 +259,6 @@ async def handle_file(client, message: Message):
         temp_dir = await FileManager.create_temp_dir()
         path = os.path.join(temp_dir, file_obj.file_name or f"video_{message.id}.mp4")
         task_id = str(uuid.uuid4())
-        task = Task(task_id=task_id, user_id=uid, task_type="video", status="pending", progress=0,
-                    message_id=message.id, chat_id=message.chat.id, data={'path': path, 'temp_dir': temp_dir, 'message': message},
-                    created_at=datetime.now(), updated_at=datetime.now(), file_name=file_obj.file_name or "video.mp4",
-                    file_size=file_obj.file_size or 0)
-        await task_manager.add(task)
-
-        user_states[uid] = {
-            'step': 'confirm_download', 'pending_task_id': task_id, 'video_path': path,
-            'video_temp_dir': temp_dir, 'status_msg': None
-        }
-
         status_msg = await message.reply_text(
             f"**File received for Subtitle Muxer!**\n\n"
             f"**Name:** `{file_obj.file_name or 'video.mp4'}`\n"
@@ -274,7 +269,16 @@ async def handle_file(client, message: Message):
                 [InlineKeyboardButton("Cancel", callback_data="cancel")]
             ])
         )
-        user_states[uid]['status_msg'] = status_msg
+        task = Task(task_id=task_id, user_id=uid, task_type="video", status="pending", progress=0,
+                    message_id=message.id, chat_id=message.chat.id, data={'path': path, 'temp_dir': temp_dir, 'message': message, 'status_msg': status_msg},
+                    created_at=datetime.now(), updated_at=datetime.now(), file_name=file_obj.file_name or "video.mp4",
+                    file_size=file_obj.file_size or 0)
+        await task_manager.add(task)
+
+        user_states[uid] = {
+            'step': 'confirm_download', 'pending_task_id': task_id, 'video_path': path,
+            'video_temp_dir': temp_dir, 'status_msg': status_msg
+        }
 
     elif is_sub and uid in user_states and user_states[uid].get('step') in ['collecting_soft_subs', 'waiting_hard_sub_file']:
         await handle_subtitle_upload(message)
@@ -344,13 +348,19 @@ async def process_soft_subs(uid, cq):
 async def show_extractable_subs(uid, cq):
     state = user_states[uid]
     info = await AsyncVideoProcessor.get_video_info_async(state['video_path'])
-    if not info or 'subtitle_streams' not in info or not info['subtitle_streams']:
+    subtitle_streams = []
+    if info:
+        if hasattr(info, 'subtitle_streams'):
+            subtitle_streams = info.subtitle_streams
+        else:
+            subtitle_streams = info.get('subtitle_streams', [])
+    if not subtitle_streams:
         return await cq.message.edit_text("No subtitles found in video.")
 
     buttons = []
-    for i, sub in enumerate(info['subtitle_streams']):
-        lang = sub.get('tags', {}).get('language', 'und')
-        title = sub.get('tags', {}).get('title', f"Track {i+1}")
+    for i, sub in enumerate(subtitle_streams):
+        lang = sub.get('tags', {}).get('language', 'und') if isinstance(sub, dict) else 'und'
+        title = sub.get('tags', {}).get('title', f"Track {i+1}") if isinstance(sub, dict) else f"Track {i+1}"
         buttons.append([InlineKeyboardButton(f"{title} ({lang})", callback_data=f"extract_sub_{i}")])
     buttons.append([InlineKeyboardButton("Back", callback_data="hard_sub_menu")])
 
@@ -359,7 +369,13 @@ async def show_extractable_subs(uid, cq):
 async def extract_and_hard_sub(uid, cq, track_idx):
     state = user_states[uid]
     info = await AsyncVideoProcessor.get_video_info_async(state['video_path'])
-    if track_idx >= len(info['subtitle_streams']):
+    subtitle_streams = []
+    if info:
+        if hasattr(info, 'subtitle_streams'):
+            subtitle_streams = info.subtitle_streams
+        else:
+            subtitle_streams = info.get('subtitle_streams', [])
+    if track_idx >= len(subtitle_streams):
         return await cq.message.edit_text("Invalid track.")
 
     temp_dir = await FileManager.create_temp_dir()
@@ -467,7 +483,7 @@ async def upload_result(tid):
     if not task: return
     try:
         await task.data['status_msg'].edit_text("Uploading...")
-        video_info = await AsyncVideoProcessor.get_video_info_async(task.data['output_path'])
+        video_info = await AsyncVideoProcessor.get_video_info_async(task.data['output_path']) or {}
         success = await StreamingUploader.upload(
             app, task.chat_id, task.data['output_path'], tid,
             "video", video_info, "Processed by Subtitle Muxer Bot!"
@@ -487,8 +503,8 @@ async def cleanup_user(uid):
         if d: await FileManager.cleanup_temp_dir(d)
     for sub in state.get('soft_subs', []):
         if sub.get('temp_dir'): await FileManager.cleanup_temp_dir(sub['temp_dir'])
-    for tid in [state.get(f"{t}_task_id") for t in ['pending', 'processing']]:
-        if tid: await task_manager.update(tid, status="cancelled")
+    for tid in [state.get(f"{t}_task_id") for t in ['pending', 'processing'] if state.get(f"{t}_task_id")]:
+        await task_manager.update(tid, status="cancelled")
     user_states.pop(uid, None)
 
 async def cleanup_task(tid):
