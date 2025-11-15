@@ -1,8 +1,9 @@
-#V2
+#V2-2
 import os
 import asyncio
 import tempfile
 import logging
+import json
 from datetime import datetime
 from typing import Dict, List, Optional
 from dataclasses import dataclass
@@ -143,7 +144,7 @@ class StreamingDownloader:
 
 class StreamingUploader:
     @staticmethod
-    async def upload(client: Client, chat_id: int, file_path: str, task_id: str, upload_mode: str, video_info: dict, caption: str) -> bool:
+    async def upload(client: Client, chat_id: int, file_path: str, task_id: str, upload_mode: str, video_info, caption: str) -> bool:
         try:
             await task_manager.update(task_id, status="uploading", progress=0)
             task = await task_manager.get(task_id)
@@ -167,8 +168,13 @@ class StreamingUploader:
                     await update_progress(task.data['status_msg'], task, "Uploading")
                     last_time, last_current = now, current
 
+            duration = int(video_info.duration) if video_info else 0
+            width = int(video_info.width) if video_info else 1280
+            height = int(video_info.height) if video_info else 720
+
             if upload_mode == "video":
-                await client.send_video(chat_id, file_path, caption=caption, thumb=thumbnail_path, progress=progress)
+                await client.send_video(chat_id, file_path, caption=caption, thumb=thumbnail_path,
+                                        duration=duration, width=width, height=height, progress=progress)
             else:
                 await client.send_document(chat_id, file_path, caption=caption, progress=progress)
             await task_manager.update(task_id, status="completed", progress=100)
@@ -345,22 +351,30 @@ async def process_soft_subs(uid, cq):
     await state['status_msg'].edit_text("Adding multiple soft subtitles...")
     await task_manager.process_q.put(task_id)
 
+async def get_subtitle_streams(file_path: str) -> List[dict]:
+    try:
+        cmd = [
+            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-show_streams', file_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return []
+        probe_data = json.loads(result.stdout)
+        return [stream for stream in probe_data.get('streams', []) if stream.get('codec_type') == 'subtitle']
+    except:
+        return []
+
 async def show_extractable_subs(uid, cq):
     state = user_states[uid]
-    info = await AsyncVideoProcessor.get_video_info_async(state['video_path'])
-    subtitle_streams = []
-    if info:
-        if hasattr(info, 'subtitle_streams'):
-            subtitle_streams = info.subtitle_streams
-        else:
-            subtitle_streams = info.get('subtitle_streams', [])
+    subtitle_streams = await get_subtitle_streams(state['video_path'])
     if not subtitle_streams:
         return await cq.message.edit_text("No subtitles found in video.")
 
     buttons = []
     for i, sub in enumerate(subtitle_streams):
-        lang = sub.get('tags', {}).get('language', 'und') if isinstance(sub, dict) else 'und'
-        title = sub.get('tags', {}).get('title', f"Track {i+1}") if isinstance(sub, dict) else f"Track {i+1}"
+        lang = sub.get('tags', {}).get('language', 'und')
+        title = sub.get('tags', {}).get('title', f"Track {i+1}")
         buttons.append([InlineKeyboardButton(f"{title} ({lang})", callback_data=f"extract_sub_{i}")])
     buttons.append([InlineKeyboardButton("Back", callback_data="hard_sub_menu")])
 
@@ -368,13 +382,7 @@ async def show_extractable_subs(uid, cq):
 
 async def extract_and_hard_sub(uid, cq, track_idx):
     state = user_states[uid]
-    info = await AsyncVideoProcessor.get_video_info_async(state['video_path'])
-    subtitle_streams = []
-    if info:
-        if hasattr(info, 'subtitle_streams'):
-            subtitle_streams = info.subtitle_streams
-        else:
-            subtitle_streams = info.get('subtitle_streams', [])
+    subtitle_streams = await get_subtitle_streams(state['video_path'])
     if track_idx >= len(subtitle_streams):
         return await cq.message.edit_text("Invalid track.")
 
@@ -433,7 +441,7 @@ async def download_worker():
                     uid = task.user_id
                     if uid in user_states and user_states[uid].get('pending_task_id') == tid:
                         info = await AsyncVideoProcessor.get_video_info_async(task.data['path'])
-                        dur = FileManager.format_duration(info.get('duration', 0)) if info else "N/A"
+                        dur = FileManager.format_duration(info.duration if info else 0)
                         await user_states[uid]['status_msg'].edit_text(
                             f"**Video Downloaded**\n**Duration:** {dur}\n\nChoose subtitle type:",
                             reply_markup=InlineKeyboardMarkup([
@@ -483,7 +491,7 @@ async def upload_result(tid):
     if not task: return
     try:
         await task.data['status_msg'].edit_text("Uploading...")
-        video_info = await AsyncVideoProcessor.get_video_info_async(task.data['output_path']) or {}
+        video_info = await AsyncVideoProcessor.get_video_info_async(task.data['output_path'])
         success = await StreamingUploader.upload(
             app, task.chat_id, task.data['output_path'], tid,
             "video", video_info, "Processed by Subtitle Muxer Bot!"
