@@ -13,4 +13,5 @@ aiofiles
 python-magic
 asyncio
 humanize
+chardet
 ##datetime
