@@ -58,6 +58,48 @@ class AsyncVideoProcessor:
         if cls._executor is None:
             cls._executor = ThreadPoolExecutor(max_workers=cls._max_workers, thread_name_prefix="video_worker")
         return cls._executor
+
+    @staticmethod
+    async def add_multiple_soft_subs(video_path: str, sub_paths: List[str], output_path: str, langs: List[str]) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            AsyncVideoProcessor._add_multiple_soft_subs_sync,
+            video_path, sub_paths, output_path, langs
+        )
+
+    @staticmethod
+    def _add_multiple_soft_subs_sync(video_path: str, sub_paths: List[str], output_path: str, langs: List[str]) -> bool:
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            cmd = ['ffmpeg', '-y', '-i', video_path]
+            for i, sub in enumerate(sub_paths):
+                cmd += ['-i', sub]
+            cmd += ['-c', 'copy', '-map', '0:v', '-map', '0:a']
+            for i in range(len(sub_paths)):
+                cmd += ['-map', f'{i+1}:0', f'-metadata:s:s:{i}', f'language={langs[i]}', f'-disposition:s:{i}', 'default' if i == 0 else '0']
+            cmd.append(output_path)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+            return result.returncode == 0 and os.path.exists(output_path)
+        except: return False
+
+    @staticmethod
+    async def extract_subtitle_async(video_path: str, track_idx: int, output_path: str) -> bool:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            AsyncVideoProcessor._extract_subtitle_sync,
+            video_path, track_idx, output_path
+        )
+
+    @staticmethod
+    def _extract_subtitle_sync(video_path: str, track_idx: int, output_path: str) -> bool:
+        try:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            cmd = ['ffmpeg', '-y', '-i', video_path, '-map', f'0:s:{track_idx}', '-c:s', 'srt', output_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            return result.returncode == 0 and os.path.getsize(output_path) > 0
+        except: return False
     
     @staticmethod
     def get_file_type(file_path: str) -> str:
